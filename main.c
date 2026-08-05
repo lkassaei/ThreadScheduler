@@ -17,9 +17,16 @@ DWORD WINAPI perform_busy_work() {
 }
 
 int main(void) {
+    LARGE_INTEGER frequency, start_time, end_time;
+    double elapsed_ms;
+
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start_time);
     // Which parameter do we have to change to be able to set the mask?
     HANDLE thread1 = CreateThread(NULL, 0, perform_busy_work, NULL, 0, NULL);
     SetThreadAffinityMask(thread1, 1); // How can we set the affinity mask if the thread is already running?
+
+    // Extra stuff we can use
     //GetThreadGroupAffinity()
     //SetThreadGroupAffinity()
 
@@ -31,6 +38,10 @@ int main(void) {
     ResumeThread(thread1);
 
     WaitForSingleObject(thread1, INFINITE);
+
+    QueryPerformanceCounter(&end_time);
+    elapsed_ms = (double)(end_time.QuadPart - start_time.QuadPart) * 1000.0 / frequency.QuadPart;
+    printf("Finished in %f", elapsed_ms);
 
     return 0;
 }
