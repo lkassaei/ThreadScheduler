@@ -29,6 +29,7 @@ typedef struct THREAD_CONTROLLER {
     int         current_priority;
     ULONG64     ticks_at_priority; // resets on demotion or on getting scheduled
     int         state;
+    LARGE_INTEGER start_time;     // QueryPerformanceCounter value at CreateThread
 } THREAD_CONTROLLER, *PTHREAD_CONTROLLER;
 
 // Flink Blink list with its own critical section
@@ -41,7 +42,9 @@ typedef struct _LOCKED_LIST {
 extern int num_threads;
 extern HANDLE threads[MAX_THREADS];
 extern THREAD_CONTROLLER thread_controls[MAX_THREADS];
+extern LOCKED_LIST wait_list;
 extern LOCKED_LIST ready_pool[NUM_PRIORITIES];
+extern HANDLE wait_event;
 
 VOID        InitializeLockedList(PLOCKED_LIST list);
 VOID        LockedInsertTail(PLOCKED_LIST list, PLIST_ENTRY entry);

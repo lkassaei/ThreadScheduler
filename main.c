@@ -12,9 +12,14 @@
 int num_threads;
 HANDLE threads[MAX_THREADS];
 THREAD_CONTROLLER thread_controls[MAX_THREADS];
+LOCKED_LIST wait_list;
 LOCKED_LIST ready_pool[NUM_PRIORITIES];
+HANDLE wait_event;
 
 DWORD WINAPI perform_busy_work(LPVOID lpParameter) {
+    PTHREAD_CONTROLLER self = (PTHREAD_CONTROLLER)lpParameter;
+
+    WaitForSingleObject(wait_event, 10);
     volatile ULONG64 count = 0;
     while (count <= GB(1)) {
         count++;
@@ -22,9 +27,17 @@ DWORD WINAPI perform_busy_work(LPVOID lpParameter) {
             printf(".");
         }
     }
-    return TRUE;
+
+    LARGE_INTEGER end_time, freq;
+    QueryPerformanceCounter(&end_time);
+    QueryPerformanceFrequency(&freq);
+    double elapsed_ms = (double)(end_time.QuadPart - self->start_time.QuadPart) * 1000.0 / freq.QuadPart;
+    printf("\nThread %d finished in %.3f ms\n", (int)(self - thread_controls), elapsed_ms);
+
+    return 0;
 }
 
+// Ready pool is an array of flink blink lists. There is one list per priority.
 int FindHighestReadyPriority(void) {
     for (int i = NUM_PRIORITIES - 1; i >= 0; i--) {
         if (!IsListEmpty(&ready_pool[i].head)) {
@@ -88,9 +101,44 @@ VOID PriorityBoost(void) {
     }
 }
 
-// A RUNNING thread whose OS handle has signaled already finished perform_busy_work
-// and returned -- without this, it stays marked RUNNING forever and permanently
-// occupies a running slot that a READY thread could otherwise use.
+// Moves a thread onto wait_list
+// Current_priority is left untouched, so it re-enters ready_pool at the same level once ExitWait runs.
+// Since a run slot just freed up, hands it to whoever's next in line.
+VOID EnterWait(PTHREAD_CONTROLLER curr_thread) {
+    SuspendThread(curr_thread->handle);
+    curr_thread->state = WAITING;
+    LockedInsertTail(&wait_list, &curr_thread->entry);
+
+    int highest = FindHighestReadyPriority();
+    if (highest >= 0) {
+        PLIST_ENTRY e = LockedRemoveHead(&ready_pool[highest]);
+        PTHREAD_CONTROLLER next = CONTAINING_RECORD(e, THREAD_CONTROLLER, entry);
+        next->state = RUNNING;
+        next->ticks_at_priority = 0;
+        ResumeThread(next->handle);
+    }
+}
+
+// Moves a thread off wait_list and back into ready, queued at whatever current_priority it already had.
+VOID ExitWait(PTHREAD_CONTROLLER curr_thread) {
+    curr_thread->state = READY;
+    LockedInsertTail(&ready_pool[curr_thread->current_priority], &curr_thread->entry);
+}
+
+// Checks for wait_event. When it's signaled, drains everyone currently on wait_list and puts back to READY.
+VOID CheckWaiting(void) {
+    if (WaitForSingleObject(wait_event, 0) != WAIT_OBJECT_0) {
+        return;
+    }
+
+    PLIST_ENTRY e;
+    while ((e = LockedRemoveHead(&wait_list)) != NULL) {
+        PTHREAD_CONTROLLER curr_thread = CONTAINING_RECORD(e, THREAD_CONTROLLER, entry);
+        ExitWait(curr_thread);
+    }
+}
+
+// Without this, a thread stays marked running forever
 VOID HandleFinished(void) {
     for (int i = 0; i < num_threads; i++) {
         PTHREAD_CONTROLLER curr_thread = &thread_controls[i];
@@ -123,6 +171,9 @@ VOID SchedulerTick(void) {
     // Check to see if anyone is done
     HandleFinished();
 
+    // Check to see if anyone doesn't need to be waiting
+    CheckWaiting();
+
     for (int i = 0; i < num_threads; i++) {
         PTHREAD_CONTROLLER curr_thread = &thread_controls[i];
 
@@ -151,9 +202,7 @@ VOID SchedulerTick(void) {
             continue;
         }
 
-        // Still RUNNING -- not queued anywhere, so just correct the fields.
-        // Reschedule() is what links this into ready_pool, and only once it
-        // actually suspends the thread.
+        // Still running
         curr_thread->current_priority = new_priority;
         curr_thread->ticks_at_priority = 0;
     }
@@ -180,9 +229,14 @@ DWORD WINAPI ClockTickSimulator(LPVOID lpParameter) {
     }
 }
 
+// Simulate event (homemade critsecs)
+// What happens when I have two at same priority?
+// Thread termination (cleanup) shutdown event
+// Timers per thread to check if they finish at same time
 int main(void) {
-    num_threads = 12;
+    num_threads = 16;
 
+    InitializeLockedList(&wait_list);
     for (int i = 0; i < NUM_PRIORITIES; i++) {
         InitializeLockedList(&ready_pool[i]);
     }
@@ -192,15 +246,20 @@ int main(void) {
     DWORD num_cores = sys_info.dwNumberOfProcessors;
 
     for (int i = 0; i < num_threads; i++) {
-        threads[i] = CreateThread(NULL, 0, perform_busy_work, NULL, CREATE_SUSPENDED, NULL);
+        // Create suspended so we can fill in the thread controls and assign a CPU
+        threads[i] = CreateThread(NULL, 0, perform_busy_work, &thread_controls[i], CREATE_SUSPENDED, NULL);
+        SetThreadPriority(threads[i], 16 + i);
+
+        QueryPerformanceCounter(&thread_controls[i].start_time);
 
         thread_controls[i].handle = threads[i];
         thread_controls[i].entry.Flink = NULL;
         thread_controls[i].entry.Blink = NULL;
-        thread_controls[i].base_priority = i;
-        thread_controls[i].current_priority = i;
+        thread_controls[i].base_priority = i + 16;
+        thread_controls[i].current_priority = i + 16;
         thread_controls[i].ticks_at_priority = 0;
 
+        // Assign the processor
         SetThreadAffinityMask(threads[i], 1ULL << (i % num_cores));
 
         if ((DWORD)i < num_cores) {
@@ -214,6 +273,7 @@ int main(void) {
         }
     }
 
+    wait_event = CreateEvent(NULL, FALSE, FALSE, NULL);
     CreateThread(NULL, 0, ClockTickSimulator, NULL, 0, NULL);
 
     LARGE_INTEGER frequency, start_time, end_time;
@@ -228,6 +288,6 @@ int main(void) {
     elapsed_ms = (double)(end_time.QuadPart - start_time.QuadPart) * 1000.0 / frequency.QuadPart;
     printf("Finished in %f", elapsed_ms);
 
+    CloseHandle(wait_event);
     return 0;
 }
-
