@@ -3,4 +3,7 @@ project(ThreadHandler C)
 
 set(CMAKE_C_STANDARD 11)
 
-add_executable(ThreadHandler main.c)
+add_executable(ThreadHandler
+        main.c
+        Lists.c
+        ThreadHandler.h)
