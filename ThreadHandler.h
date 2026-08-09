@@ -17,18 +17,19 @@
 #define DONE 3
 
 #define SUSPEND_THRESHOLD 100
+#define AGE_THRESHOLD 50 // ticks a READY/WAITING thread sits un-run before it earns a priority bump
 #define TICK_MS 5
-#define BOOST_INTERVAL_TICKS 1000 // ~5s at TICK_MS=5 -- how often everyone gets reset to base_priority
 
 #define MAX_THREADS 16
 
 typedef struct THREAD_CONTROLLER {
-    LIST_ENTRY  entry;            // link into ready_queue[priority]
-    HANDLE      handle;
-    int         base_priority;
-    int         current_priority;
-    ULONG64     ticks_at_priority; // resets on demotion or on getting scheduled
-    int         state;
+    LIST_ENTRY  entry;            // Links into ready_queue[priority]
+    HANDLE      handle;           // The thread itself
+    int         base_priority;    // What prioriy it started with
+    int         current_priority; // Current priority
+    ULONG64     ticks_at_priority;// Resets on demotion or on getting scheduled
+    ULONG64     ticks_waiting;    // Resets on getting scheduled and counts up while ready/waiting
+    int         state;            // Ready, waiting, running or finished
     LARGE_INTEGER start_time;     // QueryPerformanceCounter value at CreateThread
 } THREAD_CONTROLLER, *PTHREAD_CONTROLLER;
 

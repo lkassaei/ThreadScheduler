@@ -75,29 +75,46 @@ VOID Reschedule(void) {
             PTHREAD_CONTROLLER next = CONTAINING_RECORD(e, THREAD_CONTROLLER, entry);
             next->state = RUNNING;
             next->ticks_at_priority = 0;
+            next->ticks_waiting = 0;
             ResumeThread(next->handle);
         }
     }
 }
 
-// Undo the decay so we don't have everyone at priority 0
-VOID PriorityBoost(void) {
+// Ages every ready/waiting thread
+// The longer one sits un-run, the higher its current_priority climbs, so it eventually catches up to and can preempt
+// whatever's been hogging a core. Replaces the old periodic full-reset boost. This is continuous and per-thread instead
+// of a global sweep back to base priorities.
+VOID AgeWaiting(void) {
     for (int i = 0; i < num_threads; i++) {
         PTHREAD_CONTROLLER curr_thread = &thread_controls[i];
-        if (curr_thread->current_priority == curr_thread->base_priority) {
+        // We don't want to age threads that are running or finished
+        if (curr_thread->state != READY && curr_thread->state != WAITING) {
+            continue;
+        }
+
+        // Increase waiting times
+        curr_thread->ticks_waiting++;
+        if (curr_thread->ticks_waiting < AGE_THRESHOLD) {
+            continue;
+        }
+        curr_thread->ticks_waiting = 0;
+
+        // If we are at highest priority we cannot increase it
+        if (curr_thread->current_priority >= NUM_PRIORITIES - 1) {
             continue;
         }
 
         if (curr_thread->state == READY) {
-            // Has to move to a different priority's queue, not just change the field
+            // Priority is changing, so it has to hop to the new bucket
             LockedTryRemoveEntry(&ready_pool[curr_thread->current_priority], &curr_thread->entry);
-            curr_thread->current_priority = curr_thread->base_priority;
+            curr_thread->current_priority++;
             LockedInsertTail(&ready_pool[curr_thread->current_priority], &curr_thread->entry);
         } else {
-            // Running so not queued anywhere, just correct the field
-            curr_thread->current_priority = curr_thread->base_priority;
+            // Waiting threads sit in one flat wait_list so we can just increase priority
+            // ExitWait queues it into ready_pool at whatever this field says later
+            curr_thread->current_priority++;
         }
-        curr_thread->ticks_at_priority = 0;
     }
 }
 
@@ -115,6 +132,7 @@ VOID EnterWait(PTHREAD_CONTROLLER curr_thread) {
         PTHREAD_CONTROLLER next = CONTAINING_RECORD(e, THREAD_CONTROLLER, entry);
         next->state = RUNNING;
         next->ticks_at_priority = 0;
+        next->ticks_waiting = 0;
         ResumeThread(next->handle);
     }
 }
@@ -160,14 +178,13 @@ VOID HandleFinished(void) {
             PTHREAD_CONTROLLER next = CONTAINING_RECORD(e, THREAD_CONTROLLER, entry);
             next->state = RUNNING;
             next->ticks_at_priority = 0;
+            next->ticks_waiting = 0;
             ResumeThread(next->handle);
         }
     }
 }
 
 VOID SchedulerTick(void) {
-    static ULONG64 tick_count = 0;
-
     // Check to see if anyone is done
     HandleFinished();
 
@@ -190,15 +207,15 @@ VOID SchedulerTick(void) {
             continue;
         }
 
-        // Decrement priority
+        // Decrement only boosts
         int old_priority = curr_thread->current_priority;
         int new_priority;
 
-        if (old_priority > 0) {
+        if (old_priority > curr_thread->base_priority) {
             new_priority = old_priority - 1;
         }
         else {
-            new_priority = 0;
+            new_priority = curr_thread->base_priority;
             continue;
         }
 
@@ -207,11 +224,8 @@ VOID SchedulerTick(void) {
         curr_thread->ticks_at_priority = 0;
     }
 
-    tick_count++;
-    if (tick_count >= BOOST_INTERVAL_TICKS) {
-        tick_count = 0;
-        PriorityBoost();
-    }
+    // Long-waiting ready/waiting threads earn a priority bump here, before Reschedule decides who should be running
+    AgeWaiting();
 
     Reschedule();
 }
@@ -229,10 +243,6 @@ DWORD WINAPI ClockTickSimulator(LPVOID lpParameter) {
     }
 }
 
-// Simulate event (homemade critsecs)
-// What happens when I have two at same priority?
-// Thread termination (cleanup) shutdown event
-// Timers per thread to check if they finish at same time
 int main(void) {
     num_threads = 16;
 
@@ -258,6 +268,7 @@ int main(void) {
         thread_controls[i].base_priority = i + 16;
         thread_controls[i].current_priority = i + 16;
         thread_controls[i].ticks_at_priority = 0;
+        thread_controls[i].ticks_waiting = 0;
 
         // Assign the processor
         SetThreadAffinityMask(threads[i], 1ULL << (i % num_cores));
