@@ -21,13 +21,23 @@
 #define TICK_MS 5
 
 #define MAX_THREADS 64
-#define NUM_LOCKS 2
+#define MAX_CORES 64 // upper bound for FillIdleSlots' per-core occupancy scan
+#define NUM_LOCKS 4
 #define LOCK1_BIT (1u << 0)
 #define LOCK2_BIT (1u << 1)
+#define LOCK3_BIT (1u << 2)
+#define LOCK4_BIT (1u << 3)
+
+#define BASE_RUNNING_AMOUNT 50      // ticks (TICK_MS each) a thread runs before EnterKernelMode() traps it back in
+#define RUNNING_AMOUNT_STEP 5       // extra ticks granted per priority level
+#define WORK_CHECK_INTERVAL 200000  // how often DoBusyWork checks running_amount, in loop iterations
+
+typedef struct _SIM_LOCK SIM_LOCK, *PSIM_LOCK; // forward decl: THREAD_CONTROLLER needs to point at one
 
 typedef struct THREAD_CONTROLLER {
     LIST_ENTRY  entry;            // Links into ready_queue[priority]
     HANDLE      handle;           // The thread itself
+    int         core;             // Which core this thread is affinity-pinned to (i % num_cores)
     int         base_priority;    // What prioriy it started with
     int         current_priority; // Current priority
     ULONG64     ticks_at_priority;// Resets on demotion or on getting scheduled
@@ -36,10 +46,14 @@ typedef struct THREAD_CONTROLLER {
     ULONG64     canBeDecremented; // If the thread received a boost from another thread this is 0, else it is 1
     LARGE_INTEGER start_time;     // QueryPerformanceCounter value at CreateThread
 
+    ULONG64     running_amount;   // Ticks this dispatch is allowed to run before EnterKernelMode() traps in
+    LARGE_INTEGER dispatch_time;  // QueryPerformanceCounter value from the moment this dispatch started running
+
     ULONG       owned_locks;      // Bitmask of locks currently held (bit i = locks[i])
     ULONG       pending_locks;    // Bitmask of locks still needed to satisfy the current AcquireLocks() call
     ULONG       releasing_locks;  // Bitmask the worker wants released; ticker consumes and clears it
     HANDLE      lock_grant_event; // Signaled by the ticker once pending_locks hits 0
+    PSIM_LOCK   waiting_on_lock;  // Lock currently enqueued on in locks[i].waiters, NULL if not blocked
 } THREAD_CONTROLLER, *PTHREAD_CONTROLLER;
 
 // Flink Blink list with its own critical section
@@ -50,19 +64,20 @@ typedef struct _LOCKED_LIST {
 } LOCKED_LIST, *PLOCKED_LIST;
 
 // Metadata for our simulated locks where we know the owning thread and who is waiting on it
-typedef struct _SIM_LOCK {
+struct _SIM_LOCK {
     PTHREAD_CONTROLLER owner;
     LOCKED_LIST         waiters;
-} SIM_LOCK, *PSIM_LOCK;
+};
 
 extern int num_threads;
 extern DWORD num_cores;
 extern HANDLE threads[MAX_THREADS];
-extern THREAD_CONTROLLER thread_controls[MAX_THREADS];
+extern THREAD_CONTROLLER thread_metadata_array[MAX_THREADS];
 extern LOCKED_LIST wait_list;
 extern LOCKED_LIST ready_pool[NUM_PRIORITIES];
 extern HANDLE wait_event;
 extern SIM_LOCK locks[NUM_LOCKS];
+extern CRITICAL_SECTION scheduler_lock; // Serializes worker self-scheduling (EnterKernelMode) against SchedulerTick
 
 VOID        InitializeLockedList(PLOCKED_LIST list);
 VOID        LockedInsertTail(PLOCKED_LIST list, PLIST_ENTRY entry);
