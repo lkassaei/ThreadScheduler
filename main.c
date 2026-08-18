@@ -140,52 +140,62 @@ DWORD WINAPI perform_work_F(LPVOID lpParameter) {
     return 0;
 }
 
-// Ready pool is an array of flink blink lists. There is one list per priority. A ready thread is
-// only a valid candidate for a given physical core if it's actually pinned to that core (see
-// SetThreadAffinityMask in main()) Resuming it anywhere else wouldn't be resuming it at all,
-// the OS would just refuse to run it there. So every dispatch decision has to be scoped to
-// "highest priority among threads pinned to THIS core", not highest priority globally.
-int HighestReadyPriorityForCore(int core) {
+// Ready pool is an array of flink blink lists. There is one list per priority.
+int FindHighestReadyPriority(void) {
     for (int i = NUM_PRIORITIES - 1; i >= 0; i--) {
-        PLOCKED_LIST list = &ready_pool[i];
-        EnterCriticalSection(&list->lock);
-        BOOL found = FALSE;
-        // Find candidate based on core
-        for (PLIST_ENTRY e = list->head.Flink; e != &list->head; e = e->Flink) {
-            PTHREAD_CONTROLLER candidate = CONTAINING_RECORD(e, THREAD_CONTROLLER, entry);
-            if (candidate->core == core) {
-                found = TRUE;
-                break;
-            }
-        }
-        LeaveCriticalSection(&list->lock);
-        if (found) {
+        if (!IsListEmpty(&ready_pool[i].head)) {
             return i;
         }
     }
     return -1;
 }
 
-// Same scan, but actually unlinks and returns the match. A thread is always at least a candidate
-// for its own core, so callers freeing their own core (self->core) are guaranteed a non-NULL
-// result; callers freeing someone ELSE's core may legitimately get NULL back if nothing pinned
-// to that core happens to be ready right now.
-PTHREAD_CONTROLLER RemoveHighestReadyForCore(int core) {
+// Picks whoever should run next on `core`, and makes sure they're ACTUALLY eligible to: priority
+// always wins first, but within the single highest non-empty bucket, a candidate already pinned
+// to `core` is preferred over one that isn't, purely to avoid a pointless SetThreadAffinityMask
+// reassignment when it doesn't change the outcome. If the winner isn't already on `core`, we
+// retarget its affinity here and update its core field to match. Threads are never given a
+// multi-core mask, just a reassignable single-core one, so we always know exactly which core a
+// running thread occupies because we're the ones who just set it.
+PTHREAD_CONTROLLER RemoveNextForCore(int core) {
     for (int i = NUM_PRIORITIES - 1; i >= 0; i--) {
         PLOCKED_LIST list = &ready_pool[i];
         EnterCriticalSection(&list->lock);
+        if (IsListEmpty(&list->head)) {
+            LeaveCriticalSection(&list->lock);
+            continue;
+        }
+
+        // Prefer a same-core candidate within this top priority bucket; otherwise FIFO head.
+        PLIST_ENTRY chosen = NULL;
+        // Traverse the list
         for (PLIST_ENTRY e = list->head.Flink; e != &list->head; e = e->Flink) {
             PTHREAD_CONTROLLER candidate = CONTAINING_RECORD(e, THREAD_CONTROLLER, entry);
+            // If same core then choose this guy
             if (candidate->core == core) {
-                RemoveEntryList(e);
-                list->count--;
-                e->Flink = NULL;
-                e->Blink = NULL;
-                LeaveCriticalSection(&list->lock);
-                return candidate;
+                chosen = e;
+                break;
             }
         }
+        // Else take first guy
+        if (chosen == NULL) {
+            chosen = list->head.Flink;
+        }
+
+        // Remove from list
+        RemoveEntryList(chosen);
+        list->count--;
+        chosen->Flink = NULL;
+        chosen->Blink = NULL;
         LeaveCriticalSection(&list->lock);
+
+        // Update core for the chosen guy
+        PTHREAD_CONTROLLER next = CONTAINING_RECORD(chosen, THREAD_CONTROLLER, entry);
+        if (next->core != core) {
+            next->core = core;
+            SetThreadAffinityMask(next->handle, 1ULL << core);
+        }
+        return next;
     }
     return NULL;
 }
@@ -214,13 +224,13 @@ VOID Reschedule(void) {
             continue;
         }
 
-        int highest = HighestReadyPriorityForCore(curr_thread->core);
-        // Nobody wants curr_thread's specific core right now
+        int highest = FindHighestReadyPriority();
+        // Nobody ready anywhere so no running thread on any core could be preempted
         if (highest < 0) {
-            continue;
+            break;
         }
 
-        // If we aren't the highest priority for our own core
+        // Only a strictly higher priority candidate is worth preempting for
         if (curr_thread->current_priority < highest) {
             // Suspend and send to ready
             SuspendThread(curr_thread->handle);
@@ -228,7 +238,7 @@ VOID Reschedule(void) {
             LockedInsertTail(&ready_pool[curr_thread->current_priority], &curr_thread->entry);
 
             // Get the next guy to run on this same core
-            PTHREAD_CONTROLLER next = RemoveHighestReadyForCore(curr_thread->core);
+            PTHREAD_CONTROLLER next = RemoveNextForCore(curr_thread->core);
             InitializeThread(next);
             ResumeThread(next->handle);
         }
@@ -275,12 +285,13 @@ VOID AgeWaiting(void) {
 // Moves a thread onto wait_list
 // Current_priority is left untouched, so it re-enters ready_pool at the same level once ExitWait runs.
 // Since a run slot just freed up, hands it to whoever's next in line.
-VOID EnterWait(PTHREAD_CONTROLLER curr_thread) {
+VOID EnterWaitAndResumeNext(PTHREAD_CONTROLLER curr_thread) {
     SuspendThread(curr_thread->handle);
     curr_thread->state = WAITING;
     LockedInsertTail(&wait_list, &curr_thread->entry);
 
-    PTHREAD_CONTROLLER next = RemoveHighestReadyForCore(curr_thread->core);
+    // Make sure we are resuming on the right core
+    PTHREAD_CONTROLLER next = RemoveNextForCore(curr_thread->core);
     if (next != NULL) {
         InitializeThread(next);
         ResumeThread(next->handle);
@@ -322,7 +333,7 @@ VOID HandleFinished(void) {
         curr_thread->state = DONE;
 
         // Hand free slot to next person in line for this same core
-        PTHREAD_CONTROLLER next = RemoveHighestReadyForCore(curr_thread->core);
+        PTHREAD_CONTROLLER next = RemoveNextForCore(curr_thread->core);
         if (next != NULL) {
             InitializeThread(next);
             ResumeThread(next->handle);
@@ -399,7 +410,7 @@ VOID TryAcquireNextPendingLock(PTHREAD_CONTROLLER curr_thread) {
             SuspendThread(curr_thread->handle);
             curr_thread->state = WAITING;
 
-            PTHREAD_CONTROLLER next = RemoveHighestReadyForCore(curr_thread->core);
+            PTHREAD_CONTROLLER next = RemoveNextForCore(curr_thread->core);
             if (next != NULL) {
                 InitializeThread(next);
                 ResumeThread(next->handle);
@@ -541,7 +552,7 @@ VOID FillIdleSlots(void) {
             continue;
         }
 
-        PTHREAD_CONTROLLER next = RemoveHighestReadyForCore(i);
+        PTHREAD_CONTROLLER next = RemoveNextForCore(i);
         if (next != NULL) {
             InitializeThread(next);
             ResumeThread(next->handle);
@@ -575,7 +586,7 @@ VOID EnterKernelMode(PTHREAD_CONTROLLER self) {
 
     // Find next guy to run on THIS core
     // We're always a valid candidate for our own core (we just inserted ourselves above), so this can never come back NULL.
-    PTHREAD_CONTROLLER next = RemoveHighestReadyForCore(self->core);
+    PTHREAD_CONTROLLER next = RemoveNextForCore(self->core);
     InitializeThread(next);
 
     LeaveCriticalSection(&scheduler_lock);
